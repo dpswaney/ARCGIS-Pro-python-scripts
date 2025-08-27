@@ -1,0 +1,152 @@
+# calculates area weighted average of components of N deposition within specified watershed or lake boundaries from TDEP grids (rasters) for all available years
+# assuming that they reside in specified folders and places results (mass and mass/area) in "intersection_results.xlsx) 
+# Includes extensive error checking
+
+import arcpy
+import os
+import pandas as pd
+import re
+import time
+
+# Start execution timer
+start_time = time.time()
+
+# Set workspace and paths
+arcpy.env.workspace = r"C:\working_N_all"
+arcpy.env.overwriteOutput = True
+
+# Define input variable folders and files - replace with the appropriate folder locations and filenames
+raster_folder = r"C:\working_N_all"
+polygon_shapefile = r"C:\wshed_bndrry.shp"
+output_excel = r"C:\working_N_all\intersection_results.xlsx"
+output_raster_dir = r"C:\working_N_all\processed_rasters"
+
+# Ensure the output directory exists
+if not os.path.exists(output_raster_dir):
+    os.makedirs(output_raster_dir)
+
+# Conversion factors
+scaling_factor = 10000  # Convert raster values to integers
+cell_area_hectares = 1600  # 4 km x 4 km grid cells = 1600 hectares
+hectares_to_km2 = 0.01  # Convert hectares to km²
+
+# Prepare storage for results
+results = []
+
+# List all raster files
+raster_files = [f for f in os.listdir(raster_folder) if f.endswith('.tif')]
+
+# **Step 1: Detect All Variables Automatically**
+variable_set = set()
+for file in raster_files:
+    match = re.match(r"([a-zA-Z0-9_]+)_(tw|dw|ww)-(\d{4})\.tif", file)
+    if match:
+        variable_set.add(f"{match.group(1)}_{match.group(2)}")  # Example: Nh4_dw, Nh4_ww
+
+# Convert to a sorted list of variable names (shortened to 10 characters)
+variables = sorted(variable_set)
+variables = [var[:10] for var in variables]  # Shorten to max 10 characters
+print(f"✅ Detected Variables: {variables}")
+
+# **Step 2: Detect the Zone Field in the Polygon Shapefile**
+polygon_fields = [f.name for f in arcpy.ListFields(polygon_shapefile)]
+print(f"✅ Available fields in {polygon_shapefile}: {polygon_fields}")
+
+# Use GNIS_Name or another valid field instead of FID
+zone_field_candidates = ["GNIS_Name", "GNIS_ID", "ReachCode", "AreaSqKm"]
+zone_field = next((f for f in zone_field_candidates if f in polygon_fields), None)
+
+if not zone_field:
+    raise RuntimeError(f"❌ ERROR: No valid zone field found in {polygon_shapefile}. Fields found: {polygon_fields}")
+
+print(f"✅ Using Zone Field: {zone_field}")
+
+# **Step 3: Process Each Raster File**
+for raster_file in raster_files:
+    match = re.match(r"([a-zA-Z0-9_]+)_(tw|dw|ww)-(\d{4})\.tif", raster_file)
+    if not match:
+        print(f"⚠️ Skipping file (incorrect format): {raster_file}")
+        continue
+
+    dataset, source, year = match.groups()
+    dataset_full = f"{dataset}_{source}"[:10]  # Ensure dataset name fits 10-character limit
+
+    print(f"📌 Processing raster for dataset: {dataset_full}, year: {year}")
+
+    # Scale raster values (convert kg/ha to kg/grid cell)
+    scaled_raster = os.path.join(output_raster_dir, f"scaled_{dataset_full}_{year}.tif")
+    arcpy.gp.Times_sa(os.path.join(raster_folder, raster_file), scaling_factor * cell_area_hectares, scaled_raster)
+
+    # Convert raster to integer
+    int_raster = os.path.join(output_raster_dir, f"int_{dataset_full}_{year}.tif")
+    arcpy.gp.Int_sa(scaled_raster, int_raster)
+
+    # Convert integer raster to polygons
+    raster_polygon = os.path.join(output_raster_dir, f"raster_poly_{dataset_full}_{year}.shp")
+    arcpy.RasterToPolygon_conversion(int_raster, raster_polygon, "NO_SIMPLIFY")
+
+    # Detect correct value field in raster polygons
+    raster_fields = [f.name for f in arcpy.ListFields(raster_polygon)]
+    value_field = "gridcode" if "gridcode" in raster_fields else "Value"
+
+    # **Step 4: Intersect Raster Polygons with Analysis Polygons**
+    intersect_output = os.path.join(output_raster_dir, f"intersect_{dataset_full}_{year}.shp")
+    arcpy.Intersect_analysis([raster_polygon, polygon_shapefile], intersect_output, "ALL")
+
+    # **Step 5: Calculate area-based weights**
+    arcpy.AddField_management(intersect_output, "GArea_km2", "DOUBLE")
+    arcpy.CalculateGeometryAttributes_management(
+        intersect_output,
+        [["GArea_km2", "AREA_GEODESIC"]],
+        area_unit="SQUARE_KILOMETERS"
+    )
+
+    arcpy.AddField_management(intersect_output, "Weighted", "DOUBLE")
+    arcpy.CalculateField_management(
+        intersect_output,
+        "Weighted",
+        f"(!{value_field}! / {scaling_factor}) * (!GArea_km2! / 16.0)",  # **DIVIDE by scaling factor**
+        "PYTHON3"
+    )
+
+    # **Step 6: Summarize Total Mass for Each Polygon**
+    summary_table = os.path.join(output_raster_dir, f"summary_{dataset_full}_{year}.dbf")
+    arcpy.Statistics_analysis(intersect_output, summary_table, [["Weighted", "SUM"], ["GArea_km2", "SUM"]], case_field=zone_field)
+
+    # **Step 7: Dynamically Detect Summary Fields (Fix for 10-character truncation)**
+    summary_fields = [f.name for f in arcpy.ListFields(summary_table)]
+    print(f"✅ Available fields in summary table {summary_table}: {summary_fields}")
+
+    sum_weighted_field = next((f for f in summary_fields if "SUM_WEI" in f.upper() or "SUM_WEIGHT" in f.upper()), None)
+    sum_area_field = next((f for f in summary_fields if "SUM_GAR" in f.upper() or "SUM_GAREA" in f.upper()), None)
+
+    if not sum_weighted_field or not sum_area_field:
+        raise RuntimeError(f"❌ ERROR: Could not find valid sum fields in {summary_table}. Fields found: {summary_fields}")
+
+    print(f"✅ Using Fields: {sum_weighted_field}, {sum_area_field}")
+
+    # **Step 8: Extract Results into pandas DataFrame**
+    with arcpy.da.SearchCursor(summary_table, [zone_field, sum_weighted_field, sum_area_field]) as cursor:
+        for row in cursor:
+            polygon_id = row[0]
+            total_mass = row[1]
+            total_area_km2 = row[2]
+
+            avg_mass_per_km2 = total_mass / total_area_km2 if total_area_km2 > 0 else 0
+
+            results.append({
+                "Year": year,
+                "Dataset": dataset_full,
+                "Polygon_ID": polygon_id,
+                "TotMass": total_mass,
+                "AvgMass": avg_mass_per_km2
+            })
+
+# **Step 9: Convert Results to DataFrame**
+df = pd.DataFrame(results)
+
+# **Step 10: Export to Excel**
+df.to_excel(output_excel, index=False, engine="openpyxl")
+
+print(f"✅ Results saved to {output_excel}")
+

@@ -1,0 +1,119 @@
+# processes reduced and oxidize nitrogen values from TDEP grids (rasters) for all available years assuming data are in specified folders and puts summary data in excel file "zonal_statistics_results.xlsx"
+
+import arcpy
+import os
+import pandas as pd
+import re
+import time  # Import time module for execution time tracking
+
+# Start execution timer
+start_time = time.time()
+
+# Set workspace and paths
+arcpy.env.workspace = r"C:\working_all_nred_nox"
+arcpy.env.overwriteOutput = True
+
+# Define input folders and files - replace with appropriate names
+raster_folder = r"C:\working_all_nred_nox"
+polygon_shapefile = r"C:\current docs\projects\Finger_Lakes_Atkinson\Skaneateles\CONUSboundary.shp"  # Original name
+output_excel = r"C:\working_all_nred_nox\zonal_statistics_results.xlsx"
+output_raster_dir = r"C:\working_all_nred_nox\processed_rasters"
+
+# Ensure the output directory exists
+if not os.path.exists(output_raster_dir):
+    os.makedirs(output_raster_dir)
+
+# Conversion factors
+scaling_factor = 10000
+cell_area_hectares = 1600
+hectares_to_km2 = 0.01
+
+# Prepare results list
+results = []
+
+# List all raster files in the folder
+raster_files = [os.path.join(raster_folder, f) for f in os.listdir(raster_folder) if f.endswith('.tif')]
+
+# Process each raster file using Zonal Statistics
+for raster_file in raster_files:
+    dataset = "noxi" if "noxi" in os.path.basename(raster_file) else "nred"
+
+    # Extract year
+    year_match = re.search(r'\d{4}', os.path.basename(raster_file))
+    year = year_match.group(0) if year_match else "Unknown"
+
+    print(f"Processing raster for dataset: {dataset}, year: {year}")
+
+    # Scale raster values
+    scaled_raster = os.path.join(output_raster_dir, f"scaled_{dataset}_{year}.tif")
+    arcpy.gp.Times_sa(raster_file, scaling_factor * cell_area_hectares, scaled_raster)
+
+    if not arcpy.Exists(scaled_raster):
+        raise RuntimeError(f"Raster scaling failed for {raster_file}. Verify input data.")
+
+    # Perform Zonal Statistics
+    zonal_table = os.path.join(output_raster_dir, f"zonal_{dataset}_{year}.dbf")
+    arcpy.sa.ZonalStatisticsAsTable(
+        in_zone_data=polygon_shapefile,
+        zone_field="FID",  # This is fixed dynamically below
+        in_value_raster=scaled_raster,
+        out_table=zonal_table,
+        ignore_nodata="DATA",
+        statistics_type="SUM"
+    )
+
+    if not arcpy.Exists(zonal_table):
+        raise RuntimeError(f"Zonal Statistics failed for {scaled_raster}. Verify raster and polygon inputs.")
+
+    # Identify correct field names dynamically
+    fields = [f.name for f in arcpy.ListFields(zonal_table)]
+    sum_field = next((f for f in fields if "SUM" in f.upper()), None)
+    area_field = next((f for f in fields if "AREA" in f.upper()), None)
+    
+    # Detect the correct ID field dynamically
+    zone_field = next((f for f in fields if "ID" in f.upper() or "OID" in f.upper()), None)
+    
+    if not zone_field:
+        raise RuntimeError(f"Could not find a valid ID field in {zonal_table}. Fields found: {fields}")
+
+    if not sum_field or not area_field:
+        raise RuntimeError(f"Could not find required fields in {zonal_table}. Fields found: {fields}")
+
+    # Extract results into pandas DataFrame
+    with arcpy.da.SearchCursor(zonal_table, [zone_field, sum_field, area_field]) as cursor:
+        for row in cursor:
+            polygon_id = row[0]
+            total_mass = row[1]
+            total_area_km2 = row[2] * hectares_to_km2 if row[2] else 0  
+            avg_mass_per_km2 = total_mass / total_area_km2 if total_area_km2 > 0 else 0  
+
+            results.append({"Year": year, "Dataset": dataset, "Polygon_ID": polygon_id, "TotMass": total_mass, "AvgMass": avg_mass_per_km2})
+
+# Convert results to DataFrame
+df = pd.DataFrame(results)
+
+# Pivot Data
+df_totmass = df.pivot(index=["Year", "Polygon_ID"], columns="Dataset", values="TotMass").reset_index()
+df_avgmass = df.pivot(index=["Year", "Polygon_ID"], columns="Dataset", values="AvgMass").reset_index()
+
+# Merge Results
+final_df = pd.merge(df_totmass, df_avgmass, on=["Year", "Polygon_ID"], suffixes=("_TotMass", "_AvgMass"))
+
+# **Compute execution time**
+execution_time = time.time() - start_time
+execution_time_minutes = execution_time / 60
+
+# **Create a DataFrame for execution time**
+execution_time_df = pd.DataFrame({
+    "Metric": ["Execution Time (seconds)", "Execution Time (minutes)"],
+    "Value": [execution_time, execution_time_minutes]
+})
+
+# Export results to Excel
+with pd.ExcelWriter(output_excel, engine="openpyxl") as writer:
+    final_df.to_excel(writer, sheet_name="Zonal_Statistics_Results", index=False)
+    execution_time_df.to_excel(writer, sheet_name="Execution_Time", index=False)
+
+# Print Execution Time
+print(f"Execution Time: {execution_time:.2f} seconds ({execution_time_minutes:.2f} minutes)")
+print(f"Optimized Zonal Statistics results saved to {output_excel}")
